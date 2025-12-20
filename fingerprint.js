@@ -117,35 +117,42 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             const fp = ${fpJson};
             const targetTimezone = fp.timezone || "America/Los_Angeles";
 
+            // --- 0. Stealth System (WeakMap based toString) ---
+            const fakeFunctions = new WeakMap();
+            const originalToString = Function.prototype.toString;
+            
+            const newToString = function toString() {
+                if (typeof this === 'function' && fakeFunctions.has(this)) {
+                    return "function " + fakeFunctions.get(this) + "() { [native code] }";
+                }
+                return originalToString.call(this);
+            };
+
+            Object.defineProperty(newToString, 'name', { value: 'toString', configurable: true });
+            fakeFunctions.set(newToString, 'toString');
+            Function.prototype.toString = newToString;
+
             const makeNative = (func, name) => {
-                Object.defineProperty(func, 'toString', {
-                    value: function() { return "function " + name + "() { [native code] }"; },
-                    configurable: true,
-                    writable: true
-                });
-                // 隐藏 toString 自身的 toString
-                Object.defineProperty(func.toString, 'toString', {
-                    value: function() { return "function toString() { [native code] }"; },
-                    configurable: true,
-                    writable: true
-                });
+                fakeFunctions.set(func, name);
                 return func;
             };
 
             // --- 1. 移除 WebDriver 及 Puppeteer 特征 ---
-            if (navigator.webdriver) {
-                Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            if ('webdriver' in Navigator.prototype) {
+                Object.defineProperty(Navigator.prototype, 'webdriver', {
+                    get: makeNative(function() { return false; }, 'get webdriver'),
+                    configurable: true
+                });
             }
-            // 移除 cdc_ 变量 (Puppeteer 特征)
+
             const cdcRegex = /cdc_[a-zA-Z0-9]+/;
             for (const key in window) {
                 if (cdcRegex.test(key)) {
-                    delete window[key];
+                    try { delete window[key]; } catch(e) {}
                 }
             }
-            // 防御性移除常见自动化变量
-            ['$cdc_asdjflasutopfhvcZLmcfl_', '$chrome_asyncScriptInfo', 'callPhantom', 'webdriver'].forEach(k => {
-                 if (window[k]) delete window[k];
+            ['$cdc_asdjflasutopfhvcZLmcfl_', '$chrome_asyncScriptInfo', 'callPhantom'].forEach(k => {
+                 if (window[k]) try { delete window[k]; } catch(e) {}
             });
             Object.defineProperty(window, 'chrome', {
                 writable: true,
@@ -155,20 +162,13 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             });
 
 
-            // --- 2. Stealth Geolocation Hook (Native Mock Pattern) ---
-            // 避免使用 Proxy (会被 Pixelscan 识别为 Masking detected)
-            // 直接修改 Geolocation.prototype 并确保存根函数通过 native code 检查
+            // --- 2. Stealth Geolocation Hook (Prototype Pattern) ---
             if (fp.geolocation) {
                 const { latitude, longitude } = fp.geolocation;
-                // 精度提升到 500m - 1500m
-                const accuracy = 500 + Math.floor(Math.random() * 1000);
+                const accuracy = 500 + (fp.noiseSeed % 1000);
 
-                // 保存原始引用 (虽然我们不打算用它，但为了保险)
-                const originalGetCurrentPosition = Geolocation.prototype.getCurrentPosition;
-
-                // 创建伪造函数
-                const fakeGetCurrentPosition = function getCurrentPosition(success, error, options) {
-                    const position = {
+                const fakeGetCurrentPosition = function getCurrentPosition(success) {
+                    const pos = {
                         coords: {
                             latitude: latitude + (Math.random() - 0.5) * 0.005,
                             longitude: longitude + (Math.random() - 0.5) * 0.005,
@@ -180,16 +180,14 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                         },
                         timestamp: Date.now()
                     };
-                    // 异步回调
-                    setTimeout(() => success(position), 10);
+                    setTimeout(() => success(pos), 10);
                 };
 
-                const fakeWatchPosition = function watchPosition(success, error, options) {
-                    fakeGetCurrentPosition(success, error, options);
-                    return Math.floor(Math.random() * 10000) + 1;
+                const fakeWatchPosition = function watchPosition(s) {
+                    fakeGetCurrentPosition(s);
+                    return 1;
                 };
 
-                // 应用 Native Mock
                 Object.defineProperty(Geolocation.prototype, 'getCurrentPosition', {
                     value: makeNative(fakeGetCurrentPosition, 'getCurrentPosition'),
                     configurable: true,
@@ -203,37 +201,30 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                 });
             }
 
-            // --- 2. Intl API Language Override (Minimal Hook) ---
-            // Only hook Intl API to match --lang parameter, don't touch navigator
+            // --- 3. Intl API Language Override ---
             if (fp.language && fp.language !== 'auto') {
                 const targetLang = fp.language;
+                const ODTF = Intl.DateTimeFormat;
+                const ONF = Intl.NumberFormat;
+                const OColl = Intl.Collator;
                 
-                // Save originals
-                const OrigDTF = Intl.DateTimeFormat;
-                const OrigNF = Intl.NumberFormat;
-                const OrigColl = Intl.Collator;
-                
-                // Minimal hook - only inject default locale when not specified
                 Intl.DateTimeFormat = makeNative(function DateTimeFormat(locales, options) {
-                    if (!(this instanceof DateTimeFormat)) return OrigDTF(locales || targetLang, options);
-                    return new OrigDTF(locales || targetLang, options);
+                    if (!(this instanceof DateTimeFormat)) return ODTF(locales || targetLang, options);
+                    return new ODTF(locales || targetLang, options);
                 }, 'DateTimeFormat');
-                Intl.DateTimeFormat.prototype = OrigDTF.prototype;
-                Intl.DateTimeFormat.supportedLocalesOf = OrigDTF.supportedLocalesOf.bind(OrigDTF);
+                Intl.DateTimeFormat.prototype = ODTF.prototype;
                 
                 Intl.NumberFormat = makeNative(function NumberFormat(locales, options) {
-                    if (!(this instanceof NumberFormat)) return OrigNF(locales || targetLang, options);
-                    return new OrigNF(locales || targetLang, options);
+                    if (!(this instanceof NumberFormat)) return ONF(locales || targetLang, options);
+                    return new ONF(locales || targetLang, options);
                 }, 'NumberFormat');
-                Intl.NumberFormat.prototype = OrigNF.prototype;
-                Intl.NumberFormat.supportedLocalesOf = OrigNF.supportedLocalesOf.bind(OrigNF);
+                Intl.NumberFormat.prototype = ONF.prototype;
                 
                 Intl.Collator = makeNative(function Collator(locales, options) {
-                    if (!(this instanceof Collator)) return OrigColl(locales || targetLang, options);
-                    return new OrigColl(locales || targetLang, options);
+                    if (!(this instanceof Collator)) return OColl(locales || targetLang, options);
+                    return new OColl(locales || targetLang, options);
                 }, 'Collator');
-                Intl.Collator.prototype = OrigColl.prototype;
-                Intl.Collator.supportedLocalesOf = OrigColl.supportedLocalesOf.bind(OrigColl);
+                Intl.Collator.prototype = OColl.prototype;
             }
 
             // --- 3. Canvas Noise ---
@@ -252,80 +243,83 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             }, 'getImageData');
 
             // --- 4. Audio Noise ---
-            const originalGetChannelData = AudioBuffer.prototype.getChannelData;
-            AudioBuffer.prototype.getChannelData = makeNative(function getChannelData(channel) {
-                const results = originalGetChannelData.apply(this, arguments);
-                const noise = fp.audioNoise || 0.0000001;
-                for (let i = 0; i < 100 && i < results.length; i++) {
-                    results[i] = results[i] + noise;
+            const origGCD = AudioBuffer.prototype.getChannelData;
+            AudioBuffer.prototype.getChannelData = makeNative(function getChannelData(c) {
+                const res = origGCD.apply(this, arguments);
+                const n = fp.audioNoise || 0.0000001;
+                const seed = fp.noiseSeed || 1;
+                // 用 seed 混合索引，确保不同环境生成不同强度的确定性微噪
+                for (let i = 0; i < 100 && i < res.length; i++) {
+                    const h = Math.abs((Math.sin(i * 1e3 + seed) * 1e4) % 1);
+                    res[i] += (h - 0.5) * n;
                 }
-                return results;
+                return res;
             }, 'getChannelData');
 
-            // --- 5. Math Object Noise ---
-            const mathNoise = fp.mathNoise || 0.0000001;
+            // --- 5. Math Object Noise (Deterministic & Stable) ---
+            const mathNoise = fp.mathNoise || 0;
+            const seed = fp.noiseSeed || 1;
+            const oSin = Math.sin;
             ['acos', 'acosh', 'asin', 'asinh', 'atanh', 'atan', 'sin', 'sinh', 'cos', 'cosh', 'tan', 'tanh'].forEach(fn => {
-                const original = Math[fn];
+                const orig = Math[fn];
                 Math[fn] = makeNative(function(x) {
-                    return original(x) + (Math.random() - 0.5) * mathNoise;
+                    const v = orig(x);
+                    if (v === 0 || v === 1 || v === -1) return v;
+                    const h = Math.abs((oSin(v * 1e6 + seed) * 1e4) % 1);
+                    return v + (h - 0.5) * mathNoise;
                 }, fn);
             });
 
-            // --- 6. Media Queries Hook ---
-            const mediaQueryOverrides = fp.mediaQueries || {};
-            const originalMatchMedia = window.matchMedia;
-            window.matchMedia = makeNative(function matchMedia(query) {
-                const result = originalMatchMedia.call(window, query);
-                const queryLower = query.toLowerCase();
-                
-                let matched = false;
-                let overrideValue = null;
-
-                for (const [key, value] of Object.entries(mediaQueryOverrides)) {
-                    if (queryLower.includes(key)) {
-                        matched = true;
-                        overrideValue = value;
-                        break;
-                    }
-                }
-
-                if (matched) {
-                    const fakeResult = {
-                        matches: typeof overrideValue === 'boolean' ? overrideValue : queryLower.includes(overrideValue),
-                        media: query,
-                        onchange: null,
-                        addListener: makeNative(() => {}, 'addListener'),
-                        removeListener: makeNative(() => {}, 'removeListener'),
-                        addEventListener: makeNative(() => {}, 'addEventListener'),
-                        removeEventListener: makeNative(() => {}, 'removeEventListener'),
-                        dispatchEvent: makeNative(() => true, 'dispatchEvent')
-                    };
-                    return fakeResult;
-                }
-                return result;
-            }, 'matchMedia');
-
-            // --- 7. AudioContext.baseLatency Hook ---
-            const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
-            const baseLatencyNoise = fp.baseLatencyNoise || 0;
-            if (OriginalAudioContext) {
-                const fakeAudioContext = function AudioContext() {
-                    const ctx = new OriginalAudioContext(...arguments);
-                    const originalBaseLatency = ctx.baseLatency || 0.005;
-                    Object.defineProperty(ctx, 'baseLatency', {
-                        get: makeNative(() => originalBaseLatency + baseLatencyNoise, 'get baseLatency'),
-                        configurable: true
-                    });
-                    return ctx;
-                };
-                window.AudioContext = makeNative(fakeAudioContext, 'AudioContext');
-                if (window.webkitAudioContext) window.webkitAudioContext = window.AudioContext;
+            // --- 6. Media Queries Hook (Prototype Pattern) ---
+            const mqD = Object.getOwnPropertyDescriptor(MediaQueryList.prototype, 'matches');
+            if (mqD) {
+                const oMQ = mqD.get;
+                Object.defineProperty(MediaQueryList.prototype, 'matches', {
+                    get: makeNative(function() {
+                        const q = (this.media || "").toLowerCase();
+                        for (const [k, v] of Object.entries(fp.mediaQueries || {})) {
+                            if (q.includes(k)) {
+                                if (typeof v === 'boolean') return v;
+                                return q.includes(v);
+                            }
+                        }
+                        return oMQ.call(this);
+                    }, 'get matches'),
+                    configurable: true
+                });
             }
 
-            // --- 8. Touch Support Hook ---
+            // --- 7. AudioContext.baseLatency Hook (Prototype Pattern) ---
+            if (window.AudioContext) {
+                const alD = Object.getOwnPropertyDescriptor(AudioContext.prototype, 'baseLatency');
+                if (alD) {
+                    const oBL = alD.get;
+                    const nL = fp.baseLatencyNoise || 0;
+                    Object.defineProperty(AudioContext.prototype, 'baseLatency', {
+                        get: makeNative(function() {
+                            return oBL.call(this) + nL;
+                        }, 'get baseLatency'),
+                        configurable: true
+                    });
+                }
+            }
+
+            // --- 8. Navigator Prototype Hooks ---
             if (fp.maxTouchPoints !== undefined) {
-                Object.defineProperty(navigator, 'maxTouchPoints', {
-                    get: makeNative(() => fp.maxTouchPoints, 'get maxTouchPoints'),
+                Object.defineProperty(Navigator.prototype, 'maxTouchPoints', {
+                    get: makeNative(function() { return fp.maxTouchPoints; }, 'get maxTouchPoints'),
+                    configurable: true
+                });
+            }
+            if (fp.deviceMemory !== undefined) {
+                Object.defineProperty(Navigator.prototype, 'deviceMemory', {
+                    get: makeNative(function() { return fp.deviceMemory; }, 'get deviceMemory'),
+                    configurable: true
+                });
+            }
+            if (fp.hardwareConcurrency !== undefined) {
+                Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', {
+                    get: makeNative(function() { return fp.hardwareConcurrency; }, 'get hardwareConcurrency'),
                     configurable: true
                 });
             }
