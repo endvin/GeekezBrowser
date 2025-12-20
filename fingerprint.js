@@ -65,6 +65,27 @@ function generateFingerprint() {
         wow64: false
     };
 
+    const mathNoise = (Math.random() - 0.5) * 0.0000002; // ±0.0000001
+    const baseLatencyNoise = (Math.random() - 0.5) * 0.002; // ±0.001
+
+    // 随机色域
+    const gamutRoll = Math.random();
+    const colorGamut = gamutRoll < 0.8 ? 'srgb' : (gamutRoll < 0.99 ? 'p3' : 'rec2020');
+
+    // 媒体查询随机化
+    const mediaQueries = {
+        'color-gamut': colorGamut,
+        'prefers-reduced-motion': Math.random() < 0.1 ? 'reduce' : 'no-preference',
+        'prefers-contrast': Math.random() < 0.05 ? 'more' : 'no-preference',
+        'hdr': Math.random() < 0.1
+    };
+
+    // 触摸点支持 (Windows/Linux 随机化，macOS 保持 0)
+    let maxTouchPoints = 0;
+    if (platform !== 'darwin' && Math.random() < 0.3) {
+        maxTouchPoints = Math.random() < 0.5 ? 1 : 5;
+    }
+
     return {
         userAgent: osData.userAgentStr,
         userAgentMetadata: userAgentMetadata,
@@ -76,6 +97,10 @@ function generateFingerprint() {
         deviceMemory: [4, 8, 16][Math.floor(Math.random() * 3)],
         canvasNoise: canvasNoise,
         audioNoise: Math.random() * 0.000001,
+        mathNoise: mathNoise,
+        baseLatencyNoise: baseLatencyNoise,
+        mediaQueries: mediaQueries,
+        maxTouchPoints: maxTouchPoints,
         noiseSeed: Math.floor(Math.random() * 9999999),
         timezone: "America/Los_Angeles" // 默认值
     };
@@ -91,6 +116,21 @@ function getInjectScript(fp, profileName, watermarkStyle) {
         try {
             const fp = ${fpJson};
             const targetTimezone = fp.timezone || "America/Los_Angeles";
+
+            const makeNative = (func, name) => {
+                Object.defineProperty(func, 'toString', {
+                    value: function() { return "function " + name + "() { [native code] }"; },
+                    configurable: true,
+                    writable: true
+                });
+                // 隐藏 toString 自身的 toString
+                Object.defineProperty(func.toString, 'toString', {
+                    value: function() { return "function toString() { [native code] }"; },
+                    configurable: true,
+                    writable: true
+                });
+                return func;
+            };
 
             // --- 1. 移除 WebDriver 及 Puppeteer 特征 ---
             if (navigator.webdriver) {
@@ -122,21 +162,6 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                 const { latitude, longitude } = fp.geolocation;
                 // 精度提升到 500m - 1500m
                 const accuracy = 500 + Math.floor(Math.random() * 1000);
-
-                const makeNative = (func, name) => {
-                    Object.defineProperty(func, 'toString', {
-                        value: function() { return "function " + name + "() { [native code] }"; },
-                        configurable: true,
-                        writable: true
-                    });
-                    // 隐藏 toString 自身的 toString
-                    Object.defineProperty(func.toString, 'toString', {
-                        value: function() { return "function toString() { [native code] }"; },
-                        configurable: true,
-                        writable: true
-                    });
-                    return func;
-                };
 
                 // 保存原始引用 (虽然我们不打算用它，但为了保险)
                 const originalGetCurrentPosition = Geolocation.prototype.getCurrentPosition;
@@ -189,28 +214,31 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                 const OrigColl = Intl.Collator;
                 
                 // Minimal hook - only inject default locale when not specified
-                Intl.DateTimeFormat = function(locales, options) {
+                Intl.DateTimeFormat = makeNative(function DateTimeFormat(locales, options) {
+                    if (!(this instanceof DateTimeFormat)) return OrigDTF(locales || targetLang, options);
                     return new OrigDTF(locales || targetLang, options);
-                };
+                }, 'DateTimeFormat');
                 Intl.DateTimeFormat.prototype = OrigDTF.prototype;
                 Intl.DateTimeFormat.supportedLocalesOf = OrigDTF.supportedLocalesOf.bind(OrigDTF);
                 
-                Intl.NumberFormat = function(locales, options) {
+                Intl.NumberFormat = makeNative(function NumberFormat(locales, options) {
+                    if (!(this instanceof NumberFormat)) return OrigNF(locales || targetLang, options);
                     return new OrigNF(locales || targetLang, options);
-                };
+                }, 'NumberFormat');
                 Intl.NumberFormat.prototype = OrigNF.prototype;
                 Intl.NumberFormat.supportedLocalesOf = OrigNF.supportedLocalesOf.bind(OrigNF);
                 
-                Intl.Collator = function(locales, options) {
+                Intl.Collator = makeNative(function Collator(locales, options) {
+                    if (!(this instanceof Collator)) return OrigColl(locales || targetLang, options);
                     return new OrigColl(locales || targetLang, options);
-                };
+                }, 'Collator');
                 Intl.Collator.prototype = OrigColl.prototype;
                 Intl.Collator.supportedLocalesOf = OrigColl.supportedLocalesOf.bind(OrigColl);
             }
 
             // --- 3. Canvas Noise ---
             const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-            CanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {
+            CanvasRenderingContext2D.prototype.getImageData = makeNative(function getImageData(x, y, w, h) {
                 const imageData = originalGetImageData.apply(this, arguments);
                 if (fp.noiseSeed) {
                     for (let i = 0; i < imageData.data.length; i += 4) {
@@ -221,27 +249,96 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                     }
                 }
                 return imageData;
-            };
+            }, 'getImageData');
 
             // --- 4. Audio Noise ---
             const originalGetChannelData = AudioBuffer.prototype.getChannelData;
-            AudioBuffer.prototype.getChannelData = function(channel) {
+            AudioBuffer.prototype.getChannelData = makeNative(function getChannelData(channel) {
                 const results = originalGetChannelData.apply(this, arguments);
                 const noise = fp.audioNoise || 0.0000001;
                 for (let i = 0; i < 100 && i < results.length; i++) {
                     results[i] = results[i] + noise;
                 }
                 return results;
-            };
+            }, 'getChannelData');
 
-            // --- 5. WebRTC Protection ---
+            // --- 5. Math Object Noise ---
+            const mathNoise = fp.mathNoise || 0.0000001;
+            ['acos', 'acosh', 'asin', 'asinh', 'atanh', 'atan', 'sin', 'sinh', 'cos', 'cosh', 'tan', 'tanh'].forEach(fn => {
+                const original = Math[fn];
+                Math[fn] = makeNative(function(x) {
+                    return original(x) + (Math.random() - 0.5) * mathNoise;
+                }, fn);
+            });
+
+            // --- 6. Media Queries Hook ---
+            const mediaQueryOverrides = fp.mediaQueries || {};
+            const originalMatchMedia = window.matchMedia;
+            window.matchMedia = makeNative(function matchMedia(query) {
+                const result = originalMatchMedia.call(window, query);
+                const queryLower = query.toLowerCase();
+                
+                let matched = false;
+                let overrideValue = null;
+
+                for (const [key, value] of Object.entries(mediaQueryOverrides)) {
+                    if (queryLower.includes(key)) {
+                        matched = true;
+                        overrideValue = value;
+                        break;
+                    }
+                }
+
+                if (matched) {
+                    const fakeResult = {
+                        matches: typeof overrideValue === 'boolean' ? overrideValue : queryLower.includes(overrideValue),
+                        media: query,
+                        onchange: null,
+                        addListener: makeNative(() => {}, 'addListener'),
+                        removeListener: makeNative(() => {}, 'removeListener'),
+                        addEventListener: makeNative(() => {}, 'addEventListener'),
+                        removeEventListener: makeNative(() => {}, 'removeEventListener'),
+                        dispatchEvent: makeNative(() => true, 'dispatchEvent')
+                    };
+                    return fakeResult;
+                }
+                return result;
+            }, 'matchMedia');
+
+            // --- 7. AudioContext.baseLatency Hook ---
+            const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
+            const baseLatencyNoise = fp.baseLatencyNoise || 0;
+            if (OriginalAudioContext) {
+                const fakeAudioContext = function AudioContext() {
+                    const ctx = new OriginalAudioContext(...arguments);
+                    const originalBaseLatency = ctx.baseLatency || 0.005;
+                    Object.defineProperty(ctx, 'baseLatency', {
+                        get: makeNative(() => originalBaseLatency + baseLatencyNoise, 'get baseLatency'),
+                        configurable: true
+                    });
+                    return ctx;
+                };
+                window.AudioContext = makeNative(fakeAudioContext, 'AudioContext');
+                if (window.webkitAudioContext) window.webkitAudioContext = window.AudioContext;
+            }
+
+            // --- 8. Touch Support Hook ---
+            if (fp.maxTouchPoints !== undefined) {
+                Object.defineProperty(navigator, 'maxTouchPoints', {
+                    get: makeNative(() => fp.maxTouchPoints, 'get maxTouchPoints'),
+                    configurable: true
+                });
+            }
+
+            // --- 9. WebRTC Protection ---
             const originalPC = window.RTCPeerConnection;
-            window.RTCPeerConnection = function(config) {
+            window.RTCPeerConnection = makeNative(function RTCPeerConnection(config) {
                 if(!config) config = {};
                 config.iceTransportPolicy = 'relay'; 
                 return new originalPC(config);
-            };
+            }, 'RTCPeerConnection');
             window.RTCPeerConnection.prototype = originalPC.prototype;
+            window.RTCPeerConnection.prototype.constructor = window.RTCPeerConnection;
 
             // --- 6. 浮动水印（显示环境名称）---
             // 根据用户设置选择水印样式
